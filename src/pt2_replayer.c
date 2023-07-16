@@ -23,6 +23,7 @@ static uint8_t pattDelTime, lowMask = 0xFF, pattDelTime2;
 static int16_t modOrder, oldPattern, oldOrder;
 static uint16_t DMACONtemp;
 static int32_t modBPM, oldBPM, oldSpeed, ciaSetBPM;
+void setPlaybackSeconds(void);
 
 static const uint8_t funkTable[16] = // EFx (FunkRepeat/InvertLoop)
 {
@@ -1646,8 +1647,9 @@ void modPlay(int16_t patt, int16_t order, int8_t row)
 	// don't reset playback counter in "play/rec pattern" mode
 	if (editor.playMode != PLAY_MODE_PATTERN)
 	{
-		editor.playbackSeconds = 0;
-		editor.playbackSecondsFrac = 0;
+        setPlaybackSeconds();
+		//editor.playbackSeconds = 0;
+		//editor.playbackSecondsFrac = 0;
 	}
 
 	audio.tickSampleCounter = 0; // zero tick sample counter so that it will instantly initiate a tick
@@ -1857,3 +1859,159 @@ void resetSong(void) // only call this after storeTempVariables() has been calle
 	song->tick = 0;
 	modRenderDone = false;
 }
+
+void setPlaybackSeconds(void)
+{
+  	int8_t n_pattpos[PAULA_VOICES], n_loopcount[PAULA_VOICES];
+
+	// for pattern loop
+	memset(n_pattpos,   0, sizeof (n_pattpos));
+	memset(n_loopcount, 0, sizeof (n_loopcount));
+
+	song->rowsCounter = song->rowsInTotal  = 0;
+
+	uint8_t modRow = 0;
+	int16_t modOrder = 0;
+	uint16_t modPattern = song->header.order[0];
+	uint8_t pBreakPosition = 0;
+	bool posJumpAssert = false;
+    bool pBreakFlag = false;
+    int speed=song->currSpeed;
+    int bpm=song->currBPM;
+    uint32_t time=0;
+    uint64_t timef=0;
+    int time_done=0;
+    uint16_t currentOrder=0;
+    uint16_t currentRow=0;
+
+	memset(editor.rowVisitTable, 0, MOD_ORDERS * MOD_ROWS);
+
+	int8_t numLoops = 0;//editor.mod2WavNumLoops; // make a copy
+
+	bool calcingRows = true;
+    while (calcingRows && !time_done)
+	{
+        currentOrder=modOrder;
+        currentRow=modRow;
+		editor.rowVisitTable[(modOrder * MOD_ROWS) + modRow] = true;
+
+		for (int32_t ch = 0; ch < PAULA_VOICES; ch++)
+		{
+			note_t *note = &song->patterns[modPattern][(modRow * PAULA_VOICES) + ch];
+			if (note->command == 0x0B) // Bxx - Position Jump
+			{
+				modOrder = note->param - 1;
+				pBreakPosition = 0;
+				posJumpAssert = true;
+			}
+			else if (note->command == 0x0D) // Dxx - Pattern Break
+			{
+				pBreakPosition = (((note->param >> 4) * 10) + (note->param & 0x0F));
+				if (pBreakPosition > 63)
+					pBreakPosition = 0;
+
+				posJumpAssert = true;
+			}
+			else if (note->command == 0x0F) // F00 - Set Speed 0 (stop)
+			{
+				if (note->param==0) 
+                {
+                    calcingRows = false;
+                    break;
+                }
+                else
+                {
+                    if(editor.timingMode == TEMPO_MODE_VBLANK || (note->param < 32))
+                        speed=note->param; 
+                    else 
+                        bpm=note->param;
+                }
+			}
+			else if (note->command == 0x0E && (note->param >> 4) == 0x06) // E6x - Pattern Loop
+			{
+				uint8_t pos = note->param & 0x0F;
+				if (pos == 0)
+				{
+					n_pattpos[ch] = modRow;
+				}
+				else if (n_loopcount[ch] == 0)
+				{
+					n_loopcount[ch] = pos;
+
+					pBreakPosition = n_pattpos[ch];
+					pBreakFlag = true;
+
+					for (pos = pBreakPosition; pos <= modRow; pos++)
+						editor.rowVisitTable[(modOrder * MOD_ROWS) + pos] = false;
+				}
+				else if (--n_loopcount[ch])
+				{
+					pBreakPosition = n_pattpos[ch];
+					pBreakFlag = true;
+
+					for (pos = pBreakPosition; pos <= modRow; pos++)
+						editor.rowVisitTable[(modOrder * MOD_ROWS) + pos] = false;
+				}
+			}
+		}
+        
+        if(currentRow==song->currRow && currentOrder==song->currOrder) time_done=1;
+
+        if(time_done==0)
+        {
+            if(editor.timingMode == TEMPO_MODE_CIA)
+                timef+=musicTimeTab52[bpm-MIN_BPM]*speed;
+            else
+                timef+=musicTimeTab52[(MAX_BPM-MIN_BPM)+1]*speed;
+            time+=(timef>>52);
+            timef &=(1ULL << 52)-1;
+        }
+        
+		modRow++;
+		song->rowsInTotal++;
+
+		if (pBreakFlag)
+		{
+			modRow = pBreakPosition;
+			pBreakPosition = 0;
+			pBreakFlag = false;
+		}
+
+		if (modRow >= MOD_ROWS || posJumpAssert)
+		{
+			modRow = pBreakPosition;
+			pBreakPosition = 0;
+			posJumpAssert = false;
+
+			modOrder = (modOrder + 1) & 127;
+			if (modOrder >= song->header.numOrders)
+			{
+				modOrder = 0;
+				calcingRows = false;
+                break;
+			}
+
+			modPattern = song->header.order[modOrder];
+			if (modPattern > MAX_PATTERNS-1)
+				modPattern = MAX_PATTERNS-1;
+		}
+
+		if (calcingRows && editor.rowVisitTable[(modOrder * MOD_ROWS) + modRow])
+		{
+			// row has been visited before, we're now done!
+			calcingRows = false;
+            break;
+		}
+	}
+    if(time_done==0)
+    {
+        editor.playbackSeconds=0;
+        editor.playbackSecondsFrac=0;
+    } 
+    else
+    {
+        editor.playbackSeconds=time;
+        editor.playbackSecondsFrac=timef;
+    }  
+}
+
